@@ -96,6 +96,30 @@ jobs:
           grep -n "eden_mimalloc" "$JNI/CMakeLists.txt"
           grep -n "Eden A840" src/android/app/build.gradle.kts
 
+      - name: Aplicar parche A840 v2 (texturas invalidas)
+        run: |
+          python3 - <<'EDEN_PY_EOF'
+          import sys
+          p = "src/video_core/texture_cache/util.cpp"
+          s = open(p).read()
+          anchor = ("bool IsValidEntry(const Tegra::MemoryManager& gpu_memory, const TICEntry& config) {\n"
+                    "    const GPUVAddr address = config.Address();\n"
+                    "    if (address == 0) {\n"
+                    "        return false;\n"
+                    "    }\n")
+          add = ("    // Eden A840: a TIC entry with format 0 is an empty/garbage descriptor. Binding it as a\n"
+                 "    // real texture creates a bogus 1x1 image whose copies overrun it and can fault the GPU.\n"
+                 "    if (static_cast<u32>(config.format.Value()) == 0) {\n"
+                 "        return false;\n"
+                 "    }\n")
+          if add in s:
+              print("already patched"); sys.exit(0)
+          if s.count(anchor) != 1:
+              sys.exit("anchor not found in " + p)
+          open(p, "w").write(s.replace(anchor, anchor + add))
+          print("patched", p)
+          EDEN_PY_EOF
+
       - name: Compilar APK (tarda 1-2 horas)
         working-directory: src/android
         run: |
