@@ -120,6 +120,347 @@ jobs:
           print("patched", p)
           EDEN_PY_EOF
 
+      - name: Aplicar parche A840 v2.1 (estabilidad, NCE, latencia)
+        run: |
+          python3 - <<'EDEN_PY21_EOF'
+          #!/usr/bin/env python3
+          # Eden A840 v2.1 source patches. Run from the root of the Eden source tree.
+          # Every edit is anchored on exact text and must match exactly once; the script
+          # stops with an error otherwise. Re-running it on a patched tree is a no-op.
+          import sys
+
+          MARK = "Eden A840 v2.1"
+
+
+          def edit(path, old, new, label):
+              with open(path, encoding="utf-8") as f:
+                  src = f.read()
+              if new in src:
+                  print(f"[skip] {label}: already applied")
+                  return
+              n = src.count(old)
+              if n != 1:
+                  sys.exit(f"[FAIL] {label}: anchor found {n} times in {path}")
+              src = src.replace(old, new)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(src)
+              print(f"[ok]   {label}")
+
+
+          # ---------------------------------------------------------------------------
+          # 1. NCE: patch counter reads in modules loaded at runtime (ldr:ro / NRO).
+          #    Android blocks EL0 reads of CNTPCT_EL0, so an unpatched
+          #    "mrs xN, cntpct_el0" in an NRO kills the process with SIGILL
+          #    (EA SPORTS FC 26 crashed this way with the NCE backend).
+          # ---------------------------------------------------------------------------
+          edit("src/core/arm/nce/patcher.cpp",
+          """        } else if (auto msr = MSR{words[i]}; msr.Verify() && msr.GetSystemReg() == TpidrEl0) {
+                      BranchToPatch(offset);
+                      WriteMsrHandler(offset + sizeof(u32), oaknut::XReg{static_cast<int>(msr.GetRt())});
+                  }
+              }
+          }""",
+          """        } else if (auto msr = MSR{words[i]}; msr.Verify() && msr.GetSystemReg() == TpidrEl0) {
+                      BranchToPatch(offset);
+                      WriteMsrHandler(offset + sizeof(u32), oaknut::XReg{static_cast<int>(msr.GetRt())});
+                  } else if (auto cnt = MRS{words[i]}; cnt.Verify() && cnt.GetRt() != 31 &&
+                             cnt.GetSystemReg() == CntpctEl0) {
+                      // Eden A840 v2.1: runtime modules read the counter too.
+                      BranchToPatch(offset);
+                      WriteCntpctHandler(offset + sizeof(u32), oaknut::XReg{static_cast<int>(cnt.GetRt())});
+                  } else if (auto frq = MRS{words[i]}; frq.Verify() && frq.GetRt() != 31 &&
+                             frq.GetSystemReg() == CntfrqEl0) {
+                      BranchToPatch(offset);
+                      WriteCntfrqHandler(offset + sizeof(u32), oaknut::XReg{static_cast<int>(frq.GetRt())});
+                  }
+              }
+          }""",
+          "NCE: patch CNTPCT/CNTFRQ reads in runtime NROs")
+
+          # ---------------------------------------------------------------------------
+          # 2. Host memory: an NCE game switches the shared HostMemory to direct mapping
+          #    for good. Booting another game in the same app session then computes
+          #    every fastmem mapping wrong ("mmap: Invalid argument" thousands of times,
+          #    seen when BotW ran after Pokemon). Rebuild device memory in that case.
+          # ---------------------------------------------------------------------------
+          edit("src/common/host_memory.h",
+          """    // Windows requires it for kernels whom lack proper support for some functions!
+              bool fallback_buffer{false};
+          };""",
+          """    // Windows requires it for kernels whom lack proper support for some functions!
+              bool fallback_buffer{false};
+              // Eden A840 v2.1: set once NCE direct mapping has been enabled.
+              bool direct_mapped{false};
+
+          public:
+              [[nodiscard]] bool IsDirectMapped() const noexcept {
+                  return direct_mapped;
+              }
+          };""",
+          "HostMemory: remember direct mapping")
+
+          edit("src/common/host_memory.cpp",
+          """    if (impl) {
+                  impl->EnableDirectMappedAddress();
+                  virtual_size += reinterpret_cast<uintptr_t>(virtual_base);
+              }""",
+          """    if (impl) {
+                  impl->EnableDirectMappedAddress();
+                  virtual_size += reinterpret_cast<uintptr_t>(virtual_base);
+                  direct_mapped = true; // Eden A840 v2.1
+              }""",
+          "HostMemory: flag direct mapping")
+
+          edit("src/core/core.cpp",
+          """        const bool must_reinitialize =
+                      !device_memory.has_value() ||
+                      is_multicore != Settings::values.use_multi_core.GetValue() ||""",
+          """        const bool must_reinitialize =
+                      !device_memory.has_value() ||
+                      device_memory->buffer.IsDirectMapped() || // Eden A840 v2.1
+                      is_multicore != Settings::values.use_multi_core.GetValue() ||""",
+          "Core: rebuild device memory after an NCE session")
+
+          # ---------------------------------------------------------------------------
+          # 3. ReinterpretImage (format-changing copies through a buffer). Vulkan
+          #    validation on Turnip reported, in FC 26:
+          #      - copies naming DEPTH|STENCIL in one region (only one aspect allowed),
+          #      - reads past the source image (scaled width wider than the image),
+          #      - the upload declared VK_IMAGE_LAYOUT_GENERAL right after the image
+          #        was moved to TRANSFER_DST_OPTIMAL.
+          #    Also every region used buffer offset 0 and the staging size ignored
+          #    array layers, so multi-region or layered copies overlapped or ran past
+          #    the temporary buffer.
+          # ---------------------------------------------------------------------------
+          edit("src/video_core/renderer_vulkan/vk_texture_cache.cpp",
+          """    boost::container::small_vector<VkBufferImageCopy, 16> vk_in_copies(copies.size());
+              boost::container::small_vector<VkBufferImageCopy, 16> vk_out_copies(copies.size());
+              const VkImageAspectFlags src_aspect_mask = src.AspectMask();
+              const VkImageAspectFlags dst_aspect_mask = dst.AspectMask();
+
+              const auto bpp_in = BytesPerBlock(src.info.format) / DefaultBlockWidth(src.info.format);
+              const auto bpp_out = BytesPerBlock(dst.info.format) / DefaultBlockWidth(dst.info.format);
+              std::ranges::transform(copies, vk_in_copies.begin(),
+                                     [src_aspect_mask, bpp_in, bpp_out](const auto& copy) {
+                                         auto copy2 = copy;
+                                         copy2.src_offset.x = (bpp_out * copy.src_offset.x) / bpp_in;
+                                         copy2.extent.width = (bpp_out * copy.extent.width) / bpp_in;
+                                         return MakeBufferImageCopy(copy2, true, src_aspect_mask);
+                                     });
+              std::ranges::transform(copies, vk_out_copies.begin(), [dst_aspect_mask](const auto& copy) {
+                  return MakeBufferImageCopy(copy, false, dst_aspect_mask);
+              });
+              const u32 img_bpp = BytesPerBlock(dst.info.format);
+              size_t total_size = 0;
+              for (const auto& copy : copies) {
+                  total_size += copy.extent.width * copy.extent.height * copy.extent.depth * img_bpp;
+              }
+              const VkBuffer copy_buffer = GetTemporaryBuffer(total_size);""",
+          """    // Eden A840 v2.1: valid, non-overlapping buffer copies (see patch notes).
+              boost::container::small_vector<VkBufferImageCopy, 16> vk_in_copies;
+              boost::container::small_vector<VkBufferImageCopy, 16> vk_out_copies;
+              vk_in_copies.reserve(copies.size());
+              vk_out_copies.reserve(copies.size());
+              const VkImageAspectFlags src_aspect_mask = src.AspectMask();
+              const VkImageAspectFlags dst_aspect_mask = dst.AspectMask();
+              const auto single_aspect = [](VkImageAspectFlags mask) -> VkImageAspectFlags {
+                  if ((mask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 && (mask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) {
+                      return VK_IMAGE_ASPECT_DEPTH_BIT;
+                  }
+                  return mask;
+              };
+              const VkImageAspectFlags src_copy_aspect = single_aspect(src_aspect_mask);
+              const VkImageAspectFlags dst_copy_aspect = single_aspect(dst_aspect_mask);
+              const auto texel_bytes = [](PixelFormat format, VkImageAspectFlags aspect) -> u32 {
+                  if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) {
+                      return 1;
+                  }
+                  if (format == PixelFormat::D32_FLOAT_S8_UINT) {
+                      return 4;
+                  }
+                  return (std::max)(1U, static_cast<u32>(BytesPerBlock(format) / DefaultBlockWidth(format)));
+              };
+              const u32 bpp_in = texel_bytes(src.info.format, src_copy_aspect);
+              const u32 bpp_out = texel_bytes(dst.info.format, dst_copy_aspect);
+              const bool src_rescaled = True(src.flags & ImageFlagBits::Rescaled);
+              const auto& resolution = Settings::values.resolution_info;
+              const u32 src_width =
+                  src_rescaled ? resolution.ScaleUp(src.info.size.width) : src.info.size.width;
+              const u32 src_height =
+                  src_rescaled ? resolution.ScaleUp(src.info.size.height) : src.info.size.height;
+              const size_t img_bpp = (std::max)(BytesPerBlock(dst.info.format),
+                                                BytesPerBlock(src.info.format));
+              size_t total_size = 0;
+              for (const auto& copy : copies) {
+                  if (copy.extent.width == 0 || copy.extent.height == 0 || copy.extent.depth == 0 ||
+                      copy.src_offset.x < 0 || copy.src_offset.y < 0) {
+                      continue;
+                  }
+                  auto copy2 = copy;
+                  copy2.src_offset.x =
+                      static_cast<s32>((bpp_out * static_cast<u32>(copy.src_offset.x)) / bpp_in);
+                  copy2.extent.width = (bpp_out * copy.extent.width) / bpp_in;
+                  const u32 level = static_cast<u32>((std::max)(copy.src_subresource.base_level, 0));
+                  const u32 mip_width = (std::max)(1U, src_width >> level);
+                  const u32 mip_height = (std::max)(1U, src_height >> level);
+                  const u32 src_x = static_cast<u32>(copy2.src_offset.x);
+                  const u32 src_y = static_cast<u32>(copy2.src_offset.y);
+                  if (copy2.extent.width == 0 || src_x >= mip_width || src_y >= mip_height) {
+                      continue;
+                  }
+                  const u32 row_length = copy2.extent.width;
+                  const u32 image_height = copy2.extent.height;
+                  copy2.extent.width = (std::min)(copy2.extent.width, mip_width - src_x);
+                  copy2.extent.height = (std::min)(copy2.extent.height, mip_height - src_y);
+                  VkBufferImageCopy in_copy = MakeBufferImageCopy(copy2, true, src_copy_aspect);
+                  VkBufferImageCopy out_copy = MakeBufferImageCopy(copy, false, dst_copy_aspect);
+                  if (copy2.extent.width != row_length || copy2.extent.height != image_height) {
+                      // Keep the buffer layout of the full region so the upload lines up.
+                      in_copy.bufferRowLength = row_length;
+                      in_copy.bufferImageHeight = image_height;
+                  }
+                  in_copy.bufferOffset = total_size;
+                  out_copy.bufferOffset = total_size;
+                  vk_in_copies.push_back(in_copy);
+                  vk_out_copies.push_back(out_copy);
+                  const size_t layers = static_cast<size_t>((std::max)(
+                      1, (std::max)(copy.src_subresource.num_layers, copy.dst_subresource.num_layers)));
+                  const size_t region_size = size_t{copy.extent.width} * copy.extent.height *
+                                             copy.extent.depth * layers * img_bpp;
+                  total_size += (region_size + 15) & ~size_t{15};
+              }
+              if (vk_in_copies.empty()) {
+                  return;
+              }
+              const VkBuffer copy_buffer = GetTemporaryBuffer(total_size);""",
+          "ReinterpretImage: valid aspects, bounds, offsets and staging size")
+
+          edit("src/video_core/renderer_vulkan/vk_texture_cache.cpp",
+          """        cmdbuf.CopyBufferToImage(copy_buffer, dst_image, VK_IMAGE_LAYOUT_GENERAL, vk_out_copies);""",
+          """        cmdbuf.CopyBufferToImage(copy_buffer, dst_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                           vk_out_copies); // Eden A840 v2.1: matches the barrier""",
+          "ReinterpretImage: upload with the layout the image is in")
+
+          # ---------------------------------------------------------------------------
+          # 4. Occlusion queries were begun outside a render pass (deferred clears and
+          #    DrawTexture) and ended inside one, which Vulkan forbids; on tilers the
+          #    end is replayed per tile. Only start the counter inside a render pass.
+          # ---------------------------------------------------------------------------
+          edit("src/video_core/renderer_vulkan/vk_rasterizer.cpp",
+          """    if (!can_defer_clear) {
+                  scheduler.RequestRenderpass(framebuffer);
+              }
+
+              query_cache.NotifySegment(true);
+              query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);""",
+          """    if (!can_defer_clear) {
+                  scheduler.RequestRenderpass(framebuffer);
+              }
+
+              query_cache.NotifySegment(true);
+              if (scheduler.IsRenderPassActive() || !maxwell3d->regs.zpass_pixel_count_enable) {
+                  // Eden A840 v2.1: never begin a query outside the render pass that ends it.
+                  query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                                            maxwell3d->regs.zpass_pixel_count_enable);
+              }""",
+          "Queries: no counter start outside a render pass (clear)")
+
+          edit("src/video_core/renderer_vulkan/vk_rasterizer.cpp",
+          """    UpdateDynamicStates();
+
+              query_cache.NotifySegment(true);
+              query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, maxwell3d->regs.zpass_pixel_count_enable);
+              const auto& draw_texture_state = maxwell3d->draw_manager.draw_texture_state;""",
+          """    UpdateDynamicStates();
+
+              query_cache.NotifySegment(true);
+              if (scheduler.IsRenderPassActive() || !maxwell3d->regs.zpass_pixel_count_enable) {
+                  // Eden A840 v2.1: never begin a query outside the render pass that ends it.
+                  query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                                            maxwell3d->regs.zpass_pixel_count_enable);
+              }
+              const auto& draw_texture_state = maxwell3d->draw_manager.draw_texture_state;""",
+          "Queries: no counter start outside a render pass (draw texture)")
+
+          # ---------------------------------------------------------------------------
+          # 5. Compute pipelines always asked for a 32-wide subgroup. Adreno 8xx runs
+          #    64-wide waves; drivers that cannot honour 32 reject the pipeline
+          #    ("Adreno rejected compute shader: VK_ERROR_UNKNOWN" in Pokemon Z-A,
+          #    missing effects). Only request it when the device supports it; the
+          #    shader recompiler already copes with wider subgroups.
+          # ---------------------------------------------------------------------------
+          edit("src/video_core/vulkan_common/vulkan_device.h",
+          """    /// Returns true if the device can be forced to use the guest warp size.
+              bool IsGuestWarpSizeSupported(VkShaderStageFlagBits stage) const {
+                  return properties.subgroup_size_control.requiredSubgroupSizeStages & stage;
+              }""",
+          """    /// Returns true if the device can be forced to use the guest warp size.
+              bool IsGuestWarpSizeSupported(VkShaderStageFlagBits stage) const {
+                  return properties.subgroup_size_control.requiredSubgroupSizeStages & stage;
+              }
+
+              /// Eden A840 v2.1: true if a required subgroup size can be requested for this stage.
+              /// Adreno runs 64-wide waves: a 32-wide subgroup there is either rejected (blob) or
+              /// emulated with half-empty waves (Turnip), so let the recompiler handle wide warps.
+              bool CanRequireSubgroupSize(u32 size, VkShaderStageFlagBits stage) const {
+                  const VkDriverIdKHR driver = GetDriverID();
+                  if ((driver == VK_DRIVER_ID_MESA_TURNIP ||
+                       driver == VK_DRIVER_ID_QUALCOMM_PROPRIETARY) &&
+                      properties.subgroup_properties.subgroupSize > size) {
+                      return false;
+                  }
+                  return extensions.subgroup_size_control &&
+                         (properties.subgroup_size_control.requiredSubgroupSizeStages & stage) != 0 &&
+                         properties.subgroup_size_control.minSubgroupSize <= size &&
+                         size <= properties.subgroup_size_control.maxSubgroupSize;
+              }""",
+          "Device: helper for valid required subgroup sizes")
+
+          edit("src/video_core/renderer_vulkan/vk_compute_pipeline.cpp",
+          """                .pNext =
+                              device.IsExtSubgroupSizeControlSupported() ? &subgroup_size_ci : nullptr,""",
+          """                .pNext = device.CanRequireSubgroupSize(GuestWarpSize, VK_SHADER_STAGE_COMPUTE_BIT)
+                                       ? &subgroup_size_ci
+                                       : nullptr, // Eden A840 v2.1""",
+          "Compute pipelines: request subgroup size only when valid")
+
+          # ---------------------------------------------------------------------------
+          # 6. Input latency: the renderer could queue as many finished frames as the
+          #    swapchain has images (4 on this tablet). When the GPU is the
+          #    bottleneck at ~20-30 fps that is 100-200 ms between input and display.
+          #    On Android, without frame generation, keep two frames in flight.
+          # ---------------------------------------------------------------------------
+          edit("src/video_core/renderer_vulkan/vk_present_manager.cpp",
+          """#else
+              image_count = std::min<size_t>(swapchain.GetImageCount(), MAX_FRAMES_IN_FLIGHT);
+          #endif
+              swapchain_image_count = swapchain.GetImageCount();""",
+          """#else
+              image_count = std::min<size_t>(swapchain.GetImageCount(), MAX_FRAMES_IN_FLIGHT);
+          #endif
+          #ifdef __ANDROID__
+              // Eden A840 v2.1: low-latency presentation (two frames in flight).
+              if (!Settings::values.frame_gen.GetValue()) {
+                  image_count = std::min<size_t>(image_count, 2);
+              }
+          #endif
+              swapchain_image_count = swapchain.GetImageCount();""",
+          "Present: two frames in flight on Android")
+
+          edit("src/video_core/renderer_vulkan/vk_present_manager.cpp",
+          """size_t PresentManager::MaxExtraFrames() const {
+              return image_count - 1;
+          }""",
+          """size_t PresentManager::MaxExtraFrames() const {
+              // Eden A840 v2.1: never promise more frames than were created.
+              const size_t usable = (std::min)(image_count.load(), frames.size());
+              return usable > 0 ? usable - 1 : 0;
+          }""",
+          "Present: extra frames limited to the frames that exist")
+
+          print(MARK + ": all patches applied")
+          EDEN_PY21_EOF
+
       - name: Compilar APK (tarda 1-2 horas)
         working-directory: src/android
         run: |
@@ -129,6 +470,6 @@ jobs:
       - name: Guardar APK
         uses: actions/upload-artifact@v4
         with:
-          name: Eden-A840-apk
+          name: Eden-A840-v2.1-apk
           path: src/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
