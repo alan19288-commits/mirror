@@ -1,0 +1,110 @@
+name: Compilar Eden A840 (Android)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    steps:
+      - name: Liberar espacio en disco
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/share/swift /opt/hostedtoolcache/CodeQL /usr/local/share/powershell || true
+          df -h /
+
+      - name: Descargar el codigo de Eden
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Instalar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Instalar herramientas de Android
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools ninja-build ccache
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;28.2.13676358" "cmake;3.22.1" > /dev/null
+
+      - name: Aplicar parche A840 (mimalloc)
+        run: |
+          JNI=src/android/app/src/main/jni
+          cat > "$JNI/eden_mimalloc.cpp" <<'EDEN_CPP_EOF'
+          // SPDX-License-Identifier: GPL-3.0-or-later
+          //
+          // Eden A840 build: route every C++ allocation made by libyuzu-android through
+          // mimalloc instead of Android's scudo allocator.
+          //
+          // Scudo gives each size class a fixed-size region. Heavy games (e.g. EA SPORTS
+          // FC 26) fill several classes within a minute; scudo then serves every further
+          // allocation from its "secondary" allocator with one mmap (+ guard) each, which
+          // exhausts the per-process vm.max_map_count limit (~65530) and Eden aborts with
+          // std::bad_alloc / "Scudo ERROR: internal map failure" while the device still
+          // has gigabytes of free RAM.
+          //
+          // mimalloc carves memory out of a few large arenas, so the number of mappings
+          // stays in the hundreds no matter how many objects are allocated.
+
+          #include <mimalloc.h>
+          #include <mimalloc-new-delete.h>
+
+          namespace {
+
+          __attribute__((constructor(101))) void ConfigureEdenAllocator() {
+              // Map whole arenas read/write up front (MAP_NORESERVE on overcommit
+              // systems): committing never needs mprotect, so arenas never get split
+              // into extra mappings.
+              mi_option_set(mi_option_arena_eager_commit, 1);
+              // Reserve address space in 4 GiB arenas (value is in KiB).
+              mi_option_set(mi_option_arena_reserve, 4L * 1024 * 1024);
+              // Return unused memory with MADV_FREE/MADV_DONTNEED instead of decommit.
+              mi_option_set(mi_option_purge_decommits, 0);
+              mi_option_set(mi_option_show_errors, 0);
+              mi_option_set(mi_option_show_stats, 0);
+              mi_option_set(mi_option_verbose, 0);
+          }
+
+          } // namespace
+          EDEN_CPP_EOF
+          cat >> "$JNI/CMakeLists.txt" <<'EDEN_CMAKE_EOF'
+
+          # --- Eden A840 build: mimalloc for all C++ allocations (see eden_mimalloc.cpp) ---
+          include(FetchContent)
+          FetchContent_Declare(eden_mimalloc
+              GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+              GIT_TAG v2.1.7
+              GIT_SHALLOW TRUE)
+          set(MI_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+          set(MI_BUILD_STATIC ON CACHE BOOL "" FORCE)
+          set(MI_BUILD_OBJECT OFF CACHE BOOL "" FORCE)
+          set(MI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+          set(MI_OVERRIDE OFF CACHE BOOL "" FORCE)
+          set(MI_LOCAL_DYNAMIC_TLS ON CACHE BOOL "" FORCE)
+          set(MI_INSTALL_TOPLEVEL OFF CACHE BOOL "" FORCE)
+          FetchContent_MakeAvailable(eden_mimalloc)
+          set_target_properties(mimalloc-static PROPERTIES POSITION_INDEPENDENT_CODE ON)
+          target_compile_options(mimalloc-static PRIVATE -w)
+          target_sources(yuzu-android PRIVATE eden_mimalloc.cpp)
+          target_link_libraries(yuzu-android PRIVATE mimalloc-static)
+          EDEN_CMAKE_EOF
+          sed -i 's/"Eden Optimized"/"Eden A840"/g' src/android/app/build.gradle.kts
+          grep -n "eden_mimalloc" "$JNI/CMakeLists.txt"
+          grep -n "Eden A840" src/android/app/build.gradle.kts
+
+      - name: Compilar APK (tarda 1-2 horas)
+        working-directory: src/android
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleGenshinSpoofRelease --no-daemon --stacktrace
+
+      - name: Guardar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Eden-A840-apk
+          path: src/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
