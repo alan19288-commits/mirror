@@ -3,6 +3,9 @@ name: Compilar Eden A840 (Android)
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -461,6 +464,329 @@ jobs:
           print(MARK + ": all patches applied")
           EDEN_PY21_EOF
 
+      - name: Aplicar parche A840 v2.3 (sin limite de FPS, contador FG, latencia)
+        run: |
+          python3 - <<'EDEN_PY23_EOF'
+          #!/usr/bin/env python3
+          # Eden A840 v2.3 source patches (applied after v2.1). Run from the Eden source root.
+          # Every edit is anchored on exact text and must match exactly once.
+          import os
+          import sys
+
+
+          def edit(path, old, new, label):
+              with open(path, encoding="utf-8") as f:
+                  src = f.read()
+              if new in src:
+                  print(f"[skip] {label}: already applied")
+                  return
+              n = src.count(old)
+              if n != 1:
+                  sys.exit(f"[FAIL] {label}: anchor found {n} times in {path}")
+              src = src.replace(old, new)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(src)
+              print(f"[ok]   {label}")
+
+
+          def write_new(path, content, label):
+              if os.path.exists(path):
+                  with open(path, encoding="utf-8") as f:
+                      if f.read() == content:
+                          print(f"[skip] {label}: already present")
+                          return
+                  sys.exit(f"[FAIL] {label}: {path} already exists with other content")
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(content)
+              print(f"[ok]   {label}")
+
+
+          # ---------------------------------------------------------------------------
+          # 1. FPS cap: Eden voted the measured game frame rate (20/30 fps) on the
+          #    Android surface. Android then lowered the panel/render rate to that
+          #    value, which capped presentation at it and kept the game stuck there
+          #    (and every present waited up to a full 30 Hz period). Stop voting and
+          #    ask for the panel's highest refresh rate in the emulation window.
+          # ---------------------------------------------------------------------------
+          edit("src/android/app/src/main/jni/emu_window/emu_window.cpp",
+          """void EmuWindow_Android::UpdateFrameRateHint() {
+              auto* const surface = reinterpret_cast<ANativeWindow*>(window_info.render_surface);
+              if (!surface) {
+                  return;
+              }
+          """,
+          """void EmuWindow_Android::UpdateFrameRateHint() {
+              auto* const surface = reinterpret_cast<ANativeWindow*>(window_info.render_surface);
+              // Eden A840 v2.3: never vote a frame rate; it made Android cap the game at 20/30 fps.
+              constexpr bool vote_frame_rate = false;
+              if (!surface || !vote_frame_rate) {
+                  return;
+              }
+          """,
+          "Display: stop voting the game frame rate on the surface")
+
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt",
+          """        binding = ActivityEmulationBinding.inflate(layoutInflater)
+                  setContentView(binding.root)
+          """,
+          """        binding = ActivityEmulationBinding.inflate(layoutInflater)
+                  setContentView(binding.root)
+
+                  // Eden A840 v2.3: keep the game window at the panel's highest refresh rate.
+                  runCatching {
+                      display?.supportedModes?.maxByOrNull { it.refreshRate }?.let { mode ->
+                          val params = window.attributes
+                          params.preferredDisplayModeId = mode.modeId
+                          window.attributes = params
+                      }
+                  }
+          """,
+          "Display: highest refresh rate while emulating")
+
+          # ---------------------------------------------------------------------------
+          # 2. Optional "unlock game FPS": present every vsync instead of honouring the
+          #    game's swap interval (30 fps = interval 2, 20 fps = interval 3).
+          #    Off by default; per game. Games that tie logic to frames may speed up.
+          # ---------------------------------------------------------------------------
+          edit("src/common/settings.h",
+          """    SwitchableSetting<bool> use_video_framerate{linkage, false, "use_video_framerate",
+                                                          Category::RendererAdvanced};""",
+          """    SwitchableSetting<bool> use_video_framerate{linkage, false, "use_video_framerate",
+                                                          Category::RendererAdvanced};
+
+              // Eden A840 v2.3: ignore the game's swap interval (present every vsync).
+              SwitchableSetting<bool> unlock_guest_fps{linkage, false, "unlock_guest_fps",
+                                                       Category::RendererAdvanced};""",
+          "Settings: unlock_guest_fps")
+
+          edit("src/core/hle/service/nvnflinger/hardware_composer.cpp",
+          """#include "core/hle/service/nvdrv/devices/nvdisp_disp0.h\"""",
+          """#include "common/settings.h"
+          #include "core/hle/service/nvdrv/devices/nvdisp_disp0.h\"""",
+          "Composer: include settings")
+
+          edit("src/core/hle/service/nvnflinger/hardware_composer.cpp",
+          """    if (swap_interval >= 5) {
+                  // As an extension, treat high swap interval as precise speed control.
+                  if (out_speed_scale) {
+                      *out_speed_scale = static_cast<f32>(swap_interval) / 100.f;
+                  }
+
+                  swap_interval = 1;
+              }
+
+              return swap_interval;""",
+          """    if (swap_interval >= 5) {
+                  // As an extension, treat high swap interval as precise speed control.
+                  if (out_speed_scale) {
+                      *out_speed_scale = static_cast<f32>(swap_interval) / 100.f;
+                  }
+
+                  swap_interval = 1;
+              }
+
+              // Eden A840 v2.3: optional FPS unlock, present on every vsync.
+              if (Settings::values.unlock_guest_fps.GetValue()) {
+                  swap_interval = 1;
+              }
+
+              return swap_interval;""",
+          "Composer: honour unlock_guest_fps")
+
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/BooleanSetting.kt",
+          """    RENDERER_FRAME_GEN("frame_gen"),""",
+          """    RENDERER_FRAME_GEN("frame_gen"),
+              UNLOCK_GUEST_FPS("unlock_guest_fps"),""",
+          "UI: setting key")
+
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt",
+          """            put(
+                          SwitchSetting(
+                              BooleanSetting.RENDERER_ASYNCHRONOUS_SHADERS,
+                              titleId = R.string.renderer_asynchronous_shaders,
+                              descriptionId = R.string.renderer_asynchronous_shaders_description
+                          )
+                      )""",
+          """            put(
+                          SwitchSetting(
+                              BooleanSetting.RENDERER_ASYNCHRONOUS_SHADERS,
+                              titleId = R.string.renderer_asynchronous_shaders,
+                              descriptionId = R.string.renderer_asynchronous_shaders_description
+                          )
+                      )
+                      put(
+                          SwitchSetting(
+                              BooleanSetting.UNLOCK_GUEST_FPS,
+                              titleId = R.string.unlock_guest_fps,
+                              descriptionId = R.string.unlock_guest_fps_description
+                          )
+                      )""",
+          "UI: switch item")
+
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt",
+          """            add(BooleanSetting.RENDERER_ASYNCHRONOUS_SHADERS.key)
+                      add(IntSetting.ANDROID_PIPELINE_WORKERS.key)""",
+          """            add(BooleanSetting.RENDERER_ASYNCHRONOUS_SHADERS.key)
+                      add(BooleanSetting.UNLOCK_GUEST_FPS.key)
+                      add(IntSetting.ANDROID_PIPELINE_WORKERS.key)""",
+          "UI: show switch in Advanced Graphics")
+
+          edit("src/android/app/src/main/res/values/strings.xml",
+          """    <string name="renderer_asynchronous_shaders">Use asynchronous shaders</string>""",
+          """    <string name="unlock_guest_fps">Unlock game FPS (experimental)</string>
+              <string name="unlock_guest_fps_description">Presents every vsync instead of the game\\'s 30/20 fps interval. Some games may run too fast.</string>
+              <string name="renderer_asynchronous_shaders">Use asynchronous shaders</string>""",
+          "UI: strings (en)")
+
+          edit("src/android/app/src/main/res/values-es/strings.xml",
+          """    <string name="renderer_asynchronous_shaders">Usar sombreadores asíncronos</string>""",
+          """    <string name="unlock_guest_fps">Desbloquear FPS del juego (experimental)</string>
+              <string name="unlock_guest_fps_description">Presenta en cada vsync en lugar del intervalo de 30/20 FPS del juego. Algunos juegos pueden ir demasiado rápido.</string>
+              <string name="renderer_asynchronous_shaders">Usar sombreadores asíncronos</string>""",
+          "UI: strings (es)")
+
+          # ---------------------------------------------------------------------------
+          # 3. FPS counter with frame generation: count the frames that actually reach
+          #    the screen (real + generated) and show them next to the game FPS.
+          # ---------------------------------------------------------------------------
+          write_new("src/common/present_stats.h",
+          """// SPDX-License-Identifier: GPL-3.0-or-later
+          // Eden A840 v2.3: frames handed to the display (real + generated).
+
+          #pragma once
+
+          #include <atomic>
+          #include <cstdint>
+
+          namespace Common::PresentStats {
+
+          inline std::atomic<std::uint64_t> presented_frames{0};
+
+          } // namespace Common::PresentStats
+          """,
+          "Stats: presented frame counter header")
+
+          edit("src/video_core/renderer_vulkan/vk_present_manager.cpp",
+          """#include "common/settings.h"
+          #include "common/thread.h\"""",
+          """#include "common/present_stats.h"
+          #include "common/settings.h"
+          #include "common/thread.h\"""",
+          "Stats: include counter in present manager")
+
+          edit("src/video_core/renderer_vulkan/vk_present_manager.cpp",
+          """    // Present
+              swapchain.Present(render_semaphore);
+          }""",
+          """    // Present
+              swapchain.Present(render_semaphore);
+              Common::PresentStats::presented_frames.fetch_add(1, std::memory_order_relaxed); // Eden A840 v2.3
+          }""",
+          "Stats: count presented frames")
+
+          edit("src/android/app/src/main/jni/native.cpp",
+          """#include "common/scope_exit.h"
+          #include "common/settings.h\"""",
+          """#include <chrono>
+          #include "common/present_stats.h"
+          #include "common/scope_exit.h"
+          #include "common/settings.h\"""",
+          "Stats: include counter in JNI")
+
+          edit("src/android/app/src/main/jni/native.cpp",
+          """jdoubleArray Java_org_yuzu_yuzu_1emu_NativeLibrary_getPerfStats(JNIEnv* env, jclass clazz) {
+              jdoubleArray j_stats = env->NewDoubleArray(4);
+
+              if (EmulationSession::GetInstance().IsRunning()) {
+                  jconst results = EmulationSession::GetInstance().PerfStats();
+
+                  // Converting the structure into an array makes it easier to pass it to the frontend
+                  double stats[4] = {results.system_fps, results.average_game_fps, results.frametime,
+                                     results.emulation_speed};
+
+                  env->SetDoubleArrayRegion(j_stats, 0, 4, stats);
+              }
+
+              return j_stats;
+          }""",
+          """jdoubleArray Java_org_yuzu_yuzu_1emu_NativeLibrary_getPerfStats(JNIEnv* env, jclass clazz) {
+              jdoubleArray j_stats = env->NewDoubleArray(5);
+
+              if (EmulationSession::GetInstance().IsRunning()) {
+                  jconst results = EmulationSession::GetInstance().PerfStats();
+
+                  // Eden A840 v2.3: frames that reached the screen per second (includes generated ones).
+                  static std::uint64_t last_presented = 0;
+                  static auto last_sample = std::chrono::steady_clock::now();
+                  const auto now = std::chrono::steady_clock::now();
+                  const std::uint64_t presented =
+                      Common::PresentStats::presented_frames.load(std::memory_order_relaxed);
+                  const double seconds = std::chrono::duration<double>(now - last_sample).count();
+                  double presented_fps = 0.0;
+                  if (seconds > 0.0 && presented >= last_presented) {
+                      presented_fps = static_cast<double>(presented - last_presented) / seconds;
+                  }
+                  last_presented = presented;
+                  last_sample = now;
+
+                  // Converting the structure into an array makes it easier to pass it to the frontend
+                  double stats[5] = {results.system_fps, results.average_game_fps, results.frametime,
+                                     results.emulation_speed, presented_fps};
+
+                  env->SetDoubleArrayRegion(j_stats, 0, 5, stats);
+              }
+
+              return j_stats;
+          }""",
+          "Stats: report presented FPS")
+
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/fragments/EmulationFragment.kt",
+          """                    if (BooleanSetting.SHOW_FPS.getBoolean(needsGlobal)) {
+                                  var fpsText = String.format("FPS: %.1f", actualFps)
+                                  sb.append(fpsText)
+                              }""",
+          """                    if (BooleanSetting.SHOW_FPS.getBoolean(needsGlobal)) {
+                                  // Eden A840 v2.3: with frame generation show what reaches the screen.
+                                  val shownFps = if (perfStats.size > 4) perfStats[4] else 0.0
+                                  val fpsText = if (actualFps > 0.0 && shownFps > actualFps * 1.2) {
+                                      String.format("FPS: %.1f (FG, juego %.1f)", shownFps, actualFps)
+                                  } else {
+                                      String.format("FPS: %.1f", actualFps)
+                                  }
+                                  sb.append(fpsText)
+                              }""",
+          "Stats: overlay shows generated FPS")
+
+          # ---------------------------------------------------------------------------
+          # 4. Latency with frame generation: v2.1 kept two frames in flight only when
+          #    frame generation was off. With it on, keep one composite (real +
+          #    generated frames) plus one frame, instead of at least the swapchain size.
+          # ---------------------------------------------------------------------------
+          edit("src/video_core/renderer_vulkan/vk_present_manager.cpp",
+          """#ifdef __ANDROID__
+              // Eden A840 v2.1: low-latency presentation (two frames in flight).
+              if (!Settings::values.frame_gen.GetValue()) {
+                  image_count = std::min<size_t>(image_count, 2);
+              }
+          #endif""",
+          """#ifdef __ANDROID__
+              // Eden A840 v2.1: low-latency presentation (two frames in flight).
+              if (!Settings::values.frame_gen.GetValue()) {
+                  image_count = std::min<size_t>(image_count, 2);
+              }
+          #ifdef HAS_LSFG
+              else {
+                  // Eden A840 v2.3: one composite with its generated frames plus one frame.
+                  image_count = std::clamp<size_t>((generations + 1) * queued_composites + 1, 2,
+                                                   MAX_FRAMES_IN_FLIGHT);
+              }
+          #endif
+          #endif""",
+          "Present: low latency with frame generation")
+
+          print("Eden A840 v2.3: all patches applied")
+          EDEN_PY23_EOF
+
       - name: Compilar APK (tarda 1-2 horas)
         working-directory: src/android
         run: |
@@ -470,6 +796,20 @@ jobs:
       - name: Guardar APK
         uses: actions/upload-artifact@v4
         with:
-          name: Eden-A840-v2.1-apk
+          name: Eden-A840-v2.3-apk
           path: src/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
+
+      - name: Publicar APK en la rama builds (para copiarlo a Drive)
+        run: |
+          set -e
+          APK=$(find src/android/app/build/outputs/apk -name '*.apk' | head -1)
+          rm -rf /tmp/builds && mkdir -p /tmp/builds
+          cp "$APK" /tmp/builds/Eden-A840-v2.3.apk
+          cd /tmp/builds
+          sha256sum Eden-A840-v2.3.apk > Eden-A840-v2.3.apk.sha256
+          cat Eden-A840-v2.3.apk.sha256
+          git init -q -b builds
+          git add .
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -q -m "Eden A840 v2.3 APK (${GITHUB_SHA::7})"
+          git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" builds
