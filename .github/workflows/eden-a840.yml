@@ -1030,11 +1030,34 @@ jobs:
               });
           }
 
-          inline void ApplyProfileLocked(State& state, int level) {
+          struct TitleRule {
+              const char* title;
+              bool prefer_jit;
+          };
+
+          // Per-game knowledge gathered on this device.
+          constexpr TitleRule kTitleRules[] = {
+              // EA SPORTS FC 26: stable on Dynarmic; NCE faulted in modules it loads at runtime.
+              {"01004FF021942000", true},
+          };
+
+          inline const TitleRule* FindRule(const std::string& title) {
+              for (const auto& rule : kTitleRules) {
+                  if (title == rule.title) {
+                      return &rule;
+                  }
+              }
+              return nullptr;
+          }
+
+          inline void ApplyProfileLocked(State& state, const std::string& title, int level) {
               auto& v = Settings::values;
+              const TitleRule* const rule = FindRule(title);
+              const bool use_jit = level >= Stable || (rule != nullptr && rule->prefer_jit);
           #ifdef HAS_NCE
-              Tune(state, v.cpu_backend,
-                   level >= Stable ? Settings::CpuBackend::Dynarmic : Settings::CpuBackend::Nce);
+              Tune(state, v.cpu_backend, use_jit ? Settings::CpuBackend::Dynarmic : Settings::CpuBackend::Nce);
+          #else
+              (void)use_jit;
           #endif
               Tune(state, v.cpu_accuracy, Settings::CpuAccuracy::Auto);
               Tune(state, v.use_multi_core, true);
@@ -1042,6 +1065,7 @@ jobs:
                    level >= Balanced ? Settings::GpuAccuracy::High : Settings::GpuAccuracy::Low);
               Tune(state, v.dma_accuracy,
                    level >= Balanced ? Settings::DmaAccuracy::Safe : Settings::DmaAccuracy::Default);
+              Tune(state, v.vsync_mode, Settings::VSyncMode::Mailbox);
               Tune(state, v.use_asynchronous_gpu_emulation, true);
               Tune(state, v.use_asynchronous_shaders, true);
               Tune(state, v.use_reactive_flushing, level >= Stable);
@@ -1175,7 +1199,7 @@ jobs:
                   !Settings::values.eden_auto_tune.GetValue()) {
                   return;
               }
-              ApplyProfileLocked(state, state.pending_level);
+              ApplyProfileLocked(state, state.pending_title, state.pending_level);
               state.applied = true;
               MergeTuDebugFlag("maxgpu");
 
@@ -1487,7 +1511,7 @@ jobs:
           edit("src/android/app/src/main/res/values/strings.xml",
           """    <string name="unlock_guest_fps">Unlock game FPS (experimental)</string>""",
           """    <string name="auto_tune">A840 auto-optimization</string>
-              <string name="auto_tune_description">Chooses the best settings for each game on this Snapdragon: NCE, asynchronous shaders, 4 shader threads, even 120 Hz pacing and max GPU clocks (Turnip A840 v2.3 or newer). If a game crashes, that game moves to safer settings by itself. Anything you set for a specific game is kept.</string>
+              <string name="auto_tune_description">Chooses the best settings for each game on this Snapdragon: NCE (Dynarmic for FC 26), Mailbox presentation, asynchronous shaders, 4 shader threads, even 120 Hz pacing and max GPU clocks (Turnip A840 v2.3 or newer). If a game crashes, that game moves to safer settings by itself. Anything you set for a specific game is kept.</string>
               <string name="auto_tune_toast">Auto A840: %1$s</string>
               <string name="auto_tune_level_performance">Performance</string>
               <string name="auto_tune_level_balanced">Balanced</string>
@@ -1501,7 +1525,7 @@ jobs:
           edit("src/android/app/src/main/res/values-es/strings.xml",
           """    <string name="unlock_guest_fps">Desbloquear FPS del juego (experimental)</string>""",
           """    <string name="auto_tune">Optimización automática A840</string>
-              <string name="auto_tune_description">Elige la mejor configuración para cada juego en este Snapdragon: NCE, sombreadores asíncronos, 4 hilos de sombreadores, ritmo uniforme a 120 Hz y GPU al máximo (Turnip A840 v2.3 o más nuevo). Si un juego se cierra, ese juego pasa solo a ajustes más seguros. Respeta lo que configures a mano para un juego concreto.</string>
+              <string name="auto_tune_description">Elige la mejor configuración para cada juego en este Snapdragon: NCE (Dynarmic en FC 26), presentación Mailbox, sombreadores asíncronos, 4 hilos de sombreadores, ritmo uniforme a 120 Hz y GPU al máximo (Turnip A840 v2.3 o más nuevo). Si un juego se cierra, ese juego pasa solo a ajustes más seguros. Respeta lo que configures a mano para un juego concreto.</string>
               <string name="auto_tune_toast">Auto A840: %1$s</string>
               <string name="auto_tune_level_performance">Rendimiento</string>
               <string name="auto_tune_level_balanced">Equilibrado</string>
