@@ -787,6 +787,870 @@ jobs:
           print("Eden A840 v2.3: all patches applied")
           EDEN_PY23_EOF
 
+      - name: Aplicar parche A840 v2.4 (optimizacion automatica, latencia de entrada)
+        run: |
+          python3 - <<'EDEN_PY24_EOF'
+          #!/usr/bin/env python3
+          # Eden A840 v2.4 source patches (applied after v2.3). Run from the Eden source root.
+          # Every edit is anchored on exact text and must match exactly once.
+          import os
+          import sys
+
+
+          def edit(path, old, new, label):
+              with open(path, encoding="utf-8") as f:
+                  src = f.read()
+              if new in src:
+                  print(f"[skip] {label}: already applied")
+                  return
+              n = src.count(old)
+              if n != 1:
+                  sys.exit(f"[FAIL] {label}: anchor found {n} times in {path}")
+              src = src.replace(old, new)
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(src)
+              print(f"[ok]   {label}")
+
+
+          def write_new(path, content, label):
+              if os.path.exists(path):
+                  with open(path, encoding="utf-8") as f:
+                      if f.read() == content:
+                          print(f"[skip] {label}: already present")
+                          return
+                  sys.exit(f"[FAIL] {label}: {path} already exists with other content")
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(content)
+              print(f"[ok]   {label}")
+
+
+          # ---------------------------------------------------------------------------
+          # 1. Setting: eden_auto_tune (per game, off by default).
+          # ---------------------------------------------------------------------------
+          edit("src/common/settings.h",
+          """    SwitchableSetting<bool> unlock_guest_fps{linkage, false, "unlock_guest_fps",
+                                                       Category::RendererAdvanced};""",
+          """    SwitchableSetting<bool> unlock_guest_fps{linkage, false, "unlock_guest_fps",
+                                                       Category::RendererAdvanced};
+
+              // Eden A840 v2.4: automatic per-game optimisation for Snapdragon 8 Elite Gen 5 (Android).
+              SwitchableSetting<bool> eden_auto_tune{linkage, false, "eden_auto_tune",
+                                                     Category::RendererAdvanced};""",
+          "Settings: eden_auto_tune")
+
+          # ---------------------------------------------------------------------------
+          # 2. Native auto-tune engine (header only, used by native.cpp and native_config.cpp).
+          # ---------------------------------------------------------------------------
+          write_new("src/android/app/src/main/jni/eden_auto_tune.h", r"""// SPDX-License-Identifier: GPL-3.0-or-later
+          // Eden A840 v2.4: automatic per-game optimisation for Snapdragon 8 Elite Gen 5 / Adreno 840.
+          //
+          // When "eden_auto_tune" is on, every boot gets a profile chosen for this SoC. The profile only
+          // touches settings the user did not customise for that game, lives on the per-game ("custom")
+          // layer of each setting so the global configuration is never rewritten, and is undone when the
+          // game stops. A crash during a session moves that game to a safer level; after several clean
+          // sessions the faster level is tried once more.
+
+          #pragma once
+
+          #include <algorithm>
+          #include <cctype>
+          #include <chrono>
+          #include <cstdint>
+          #include <cstdlib>
+          #include <filesystem>
+          #include <fstream>
+          #include <functional>
+          #include <map>
+          #include <memory>
+          #include <mutex>
+          #include <sstream>
+          #include <string>
+          #include <thread>
+          #include <utility>
+          #include <vector>
+
+          #include "android_settings.h"
+          #include "common/fs/path_util.h"
+          #include "common/logging.h"
+          #include "common/scm_rev.h"
+          #include "common/settings.h"
+
+          namespace EdenAutoTune {
+
+          enum Level : int {
+              Performance = 0,
+              Balanced = 1,
+              Stable = 2,
+          };
+
+          enum Event : int {
+              NoEvent = 0,
+              Escalated = 1,
+              Probing = 2,
+              Reset = 3,
+          };
+
+          constexpr int kMaxLevel = Stable;
+          constexpr std::int64_t kCleanSessionsBeforeProbe = 4;
+          constexpr std::int64_t kMinCleanSessionMs = 120'000;
+
+          using KeyValues = std::map<std::string, std::string>;
+
+          struct Override {
+              std::function<bool()> holds;
+              std::function<void()> undo;
+              std::function<bool()> redo;
+          };
+
+          struct State {
+              std::mutex mutex;
+              std::string pending_title;
+              int pending_level = -1;
+              std::vector<Override> overrides;
+              bool applied = false;
+              bool suspended = false;
+              std::string session_title;
+              std::int64_t session_started = 0;
+          };
+
+          inline State& Get() {
+              static State state;
+              return state;
+          }
+
+          inline std::int64_t NowMs() {
+              return std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::system_clock::now().time_since_epoch())
+                  .count();
+          }
+
+          inline std::filesystem::path Dir() {
+              return Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir) / "auto_tune";
+          }
+
+          inline std::filesystem::path TitlePath(const std::string& title) {
+              return Dir() / (title + ".ini");
+          }
+
+          inline std::filesystem::path SessionPath() {
+              return Dir() / "session.ini";
+          }
+
+          inline KeyValues ReadKv(const std::filesystem::path& path) {
+              KeyValues kv;
+              std::ifstream in(path);
+              std::string line;
+              while (std::getline(in, line)) {
+                  const auto eq = line.find('=');
+                  if (eq != std::string::npos) {
+                      kv[line.substr(0, eq)] = line.substr(eq + 1);
+                  }
+              }
+              return kv;
+          }
+
+          inline void WriteKv(const std::filesystem::path& path, const KeyValues& kv) {
+              std::error_code ec;
+              std::filesystem::create_directories(path.parent_path(), ec);
+              const std::string tmp = path.string() + ".tmp";
+              {
+                  std::ofstream out(tmp, std::ios::trunc);
+                  for (const auto& [key, value] : kv) {
+                      out << key << '=' << value << '\n';
+                  }
+                  if (!out) {
+                      return;
+                  }
+              }
+              std::filesystem::rename(tmp, path, ec);
+          }
+
+          inline std::int64_t ToInt(const KeyValues& kv, const char* key, std::int64_t fallback = 0) {
+              const auto it = kv.find(key);
+              if (it == kv.end()) {
+                  return fallback;
+              }
+              try {
+                  return std::stoll(it->second);
+              } catch (...) {
+                  return fallback;
+              }
+          }
+
+          inline std::string SanitizeTitle(const std::string& title) {
+              std::string out;
+              for (const char c : title) {
+                  if (std::isalnum(static_cast<unsigned char>(c))) {
+                      out += c;
+                  }
+              }
+              return out.empty() ? std::string{"0"} : out;
+          }
+
+          inline std::string BuildId() {
+              return std::string{"A840-v2.4 "} + Common::g_build_fullname + " " + Common::g_build_date;
+          }
+
+          inline const char* LevelName(int level) {
+              switch (level) {
+              case Performance:
+                  return "performance";
+              case Balanced:
+                  return "balanced";
+              default:
+                  return "stable";
+              }
+          }
+
+          // Puts `value` on the custom layer of a setting the user left on the global value.
+          template <typename T, bool R>
+          inline void Tune(State& state, Settings::SwitchableSetting<T, R>& setting, T value) {
+              auto* const p = &setting;
+              auto saved = std::make_shared<T>();
+              auto apply = [p, value, saved]() -> bool {
+                  if (!p->UsingGlobal()) {
+                      return false;
+                  }
+                  p->SetGlobal(false);
+                  *saved = p->GetValue();
+                  p->SetValue(value);
+                  return true;
+              };
+              if (!apply()) {
+                  return;
+              }
+              const T tuned = p->GetValue();
+              state.overrides.push_back(Override{
+                  [p, tuned] { return !p->UsingGlobal() && p->GetValue() == tuned; },
+                  [p, saved] {
+                      p->SetValue(*saved);
+                      p->SetGlobal(true);
+                  },
+                  std::move(apply),
+              });
+          }
+
+          inline void ApplyProfileLocked(State& state, int level) {
+              auto& v = Settings::values;
+          #ifdef HAS_NCE
+              Tune(state, v.cpu_backend,
+                   level >= Stable ? Settings::CpuBackend::Dynarmic : Settings::CpuBackend::Nce);
+          #endif
+              Tune(state, v.cpu_accuracy, Settings::CpuAccuracy::Auto);
+              Tune(state, v.use_multi_core, true);
+              Tune(state, v.gpu_accuracy,
+                   level >= Balanced ? Settings::GpuAccuracy::High : Settings::GpuAccuracy::Low);
+              Tune(state, v.dma_accuracy,
+                   level >= Balanced ? Settings::DmaAccuracy::Safe : Settings::DmaAccuracy::Default);
+              Tune(state, v.use_asynchronous_gpu_emulation, true);
+              Tune(state, v.use_asynchronous_shaders, true);
+              Tune(state, v.use_reactive_flushing, level >= Stable);
+              Tune(state, v.use_disk_shader_cache, true);
+              Tune(state, v.use_vulkan_driver_pipeline_cache, true);
+              if (std::thread::hardware_concurrency() >= 8) {
+                  Tune(state, AndroidSettings::values.pipeline_worker_count, 4);
+              }
+          }
+
+          inline void RestoreLocked(State& state) {
+              if (!state.suspended) {
+                  for (auto it = state.overrides.rbegin(); it != state.overrides.rend(); ++it) {
+                      if (it->holds()) {
+                          it->undo();
+                      }
+                  }
+              }
+              state.overrides.clear();
+              state.applied = false;
+              state.suspended = false;
+          }
+
+          inline void MergeTuDebugFlag(const std::string& flag) {
+              std::string value;
+              if (const char* current = std::getenv("TU_DEBUG")) {
+                  value = current;
+              }
+              std::stringstream tokens(value);
+              std::string token;
+              while (std::getline(tokens, token, ',')) {
+                  if (token == flag) {
+                      return;
+                  }
+              }
+              if (!value.empty()) {
+                  value += ',';
+              }
+              value += flag;
+              setenv("TU_DEBUG", value.c_str(), 1);
+          }
+
+          // Turnip reads TU_DEBUG once per process, so this runs before the driver is first used.
+          // "maxgpu" (Turnip A840 v2.3+) keeps the GPU at its top power level while it renders.
+          inline void PrepareDriverEnv() {
+              if (Settings::values.eden_auto_tune.GetValue()) {
+                  MergeTuDebugFlag("maxgpu");
+              }
+          }
+
+          // Called before boot. Returns -1 when disabled, otherwise level | (event << 4).
+          inline int Prepare(const std::string& raw_title, const std::vector<std::int64_t>& crash_times,
+                             const std::string& driver) {
+              auto& state = Get();
+              std::scoped_lock lock{state.mutex};
+              state.pending_title.clear();
+              state.pending_level = -1;
+              if (!Settings::values.eden_auto_tune.GetValue()) {
+                  return -1;
+              }
+
+              const std::string title = SanitizeTitle(raw_title);
+              const std::int64_t now = NowMs();
+              int event = NoEvent;
+
+              // Attribute an Android-reported crash to the session that was open, whichever game it was.
+              KeyValues session = ReadKv(SessionPath());
+              if (ToInt(session, "open") == 1) {
+                  const std::int64_t started = ToInt(session, "started");
+                  const bool crashed = std::any_of(crash_times.begin(), crash_times.end(),
+                                                   [&](std::int64_t t) { return t >= started && t <= now; });
+                  const std::string previous = session["title"];
+                  if (crashed && !previous.empty()) {
+                      KeyValues st = ReadKv(TitlePath(previous));
+                      const std::int64_t level = std::clamp<std::int64_t>(ToInt(st, "level"), 0, kMaxLevel);
+                      if (ToInt(st, "probed") == 1) {
+                          st["locked"] = "1";
+                      }
+                      const std::int64_t next = std::min<std::int64_t>(level + 1, kMaxLevel);
+                      st["level"] = std::to_string(next);
+                      st["probe"] = "0";
+                      st["clean"] = "0";
+                      st["crashes"] = std::to_string(ToInt(st, "crashes") + 1);
+                      WriteKv(TitlePath(previous), st);
+                      LOG_WARNING(Frontend, "[AutoTune] {} crashed in its last session, level {} -> {}",
+                                  previous, level, next);
+                      if (previous == title && next != level) {
+                          event = Escalated;
+                      }
+                  }
+                  session["open"] = "0";
+                  WriteKv(SessionPath(), session);
+              }
+
+              KeyValues st = ReadKv(TitlePath(title));
+              const std::string build = BuildId();
+              if (!st.empty() && (st["build"] != build || st["driver"] != driver)) {
+                  if (ToInt(st, "level") > 0) {
+                      event = Reset;
+                  }
+                  st.clear();
+              }
+              st["build"] = build;
+              st["driver"] = driver;
+
+              int level = static_cast<int>(std::clamp<std::int64_t>(ToInt(st, "level"), 0, kMaxLevel));
+              if (event == NoEvent && level > 0 && ToInt(st, "locked") == 0 &&
+                  ToInt(st, "clean") >= kCleanSessionsBeforeProbe) {
+                  level -= 1;
+                  st["probe"] = "1";
+                  st["probed"] = "1";
+                  st["clean"] = "0";
+                  event = Probing;
+              }
+              st["level"] = std::to_string(level);
+              WriteKv(TitlePath(title), st);
+
+              state.pending_title = title;
+              state.pending_level = level;
+              LOG_INFO(Frontend, "[AutoTune] {} -> {} profile (event {}, driver '{}')", title,
+                       LevelName(level), event, driver);
+              return level | (event << 4);
+          }
+
+          // Called on the emulation thread right before the system applies settings and boots.
+          inline void ApplyPending() {
+              auto& state = Get();
+              std::scoped_lock lock{state.mutex};
+              RestoreLocked(state);
+              if (state.pending_level < 0 || state.pending_title.empty() ||
+                  !Settings::values.eden_auto_tune.GetValue()) {
+                  return;
+              }
+              ApplyProfileLocked(state, state.pending_level);
+              state.applied = true;
+              MergeTuDebugFlag("maxgpu");
+
+              state.session_title = state.pending_title;
+              state.session_started = NowMs();
+              WriteKv(SessionPath(), KeyValues{
+                                         {"title", state.session_title},
+                                         {"started", std::to_string(state.session_started)},
+                                         {"open", "1"},
+                                     });
+              LOG_INFO(Frontend, "[AutoTune] applied {} profile to {} ({} settings)",
+                       LevelName(state.pending_level), state.session_title, state.overrides.size());
+          }
+
+          // Called when emulation stops normally.
+          inline void OnShutdown() {
+              auto& state = Get();
+              std::scoped_lock lock{state.mutex};
+              RestoreLocked(state);
+              if (state.session_started == 0) {
+                  return;
+              }
+              const std::int64_t duration = NowMs() - state.session_started;
+              WriteKv(SessionPath(), KeyValues{
+                                         {"title", state.session_title},
+                                         {"started", std::to_string(state.session_started)},
+                                         {"open", "0"},
+                                     });
+              if (duration >= kMinCleanSessionMs) {
+                  KeyValues st = ReadKv(TitlePath(state.session_title));
+                  if (!st.empty()) {
+                      st["clean"] = std::to_string(ToInt(st, "clean") + 1);
+                      st["probe"] = "0";
+                      WriteKv(TitlePath(state.session_title), st);
+                  }
+              }
+              state.session_started = 0;
+          }
+
+          // Gives the user's own values back while settings are being edited or saved.
+          inline bool Suspend() {
+              auto& state = Get();
+              std::scoped_lock lock{state.mutex};
+              if (!state.applied || state.suspended) {
+                  return false;
+              }
+              std::vector<Override> kept;
+              for (auto& o : state.overrides) {
+                  if (o.holds()) {
+                      o.undo();
+                      kept.push_back(std::move(o));
+                  }
+              }
+              state.overrides = std::move(kept);
+              state.suspended = true;
+              return true;
+          }
+
+          inline void Resume() {
+              auto& state = Get();
+              std::scoped_lock lock{state.mutex};
+              if (!state.applied || !state.suspended) {
+                  return;
+              }
+              state.suspended = false;
+              if (!Settings::values.eden_auto_tune.GetValue()) {
+                  state.overrides.clear();
+                  state.applied = false;
+                  return;
+              }
+              std::vector<Override> kept;
+              for (auto& o : state.overrides) {
+                  if (o.redo()) {
+                      kept.push_back(std::move(o));
+                  }
+              }
+              state.overrides = std::move(kept);
+          }
+
+          } // namespace EdenAutoTune
+          """,
+          "AutoTune: engine header")
+
+          edit("src/android/app/src/main/jni/native.cpp",
+          """#include "common/present_stats.h\"""",
+          """#include "common/present_stats.h"
+          #include "eden_auto_tune.h\"""",
+          "Native: include auto-tune")
+
+          edit("src/android/app/src/main/jni/native.cpp",
+          """    m_software_keyboard = android_keyboard.get();
+              m_system.SetShuttingDown(false);
+              m_system.ApplySettings();""",
+          """    m_software_keyboard = android_keyboard.get();
+              m_system.SetShuttingDown(false);
+              // Eden A840 v2.4: per-game automatic profile, applied right before boot.
+              EdenAutoTune::ApplyPending();
+              m_system.ApplySettings();""",
+          "Native: apply auto-tune profile at boot")
+
+          edit("src/android/app/src/main/jni/native.cpp",
+          """void EmulationSession::ShutdownEmulation() {
+              std::scoped_lock lock(m_mutex);
+          """,
+          """void EmulationSession::ShutdownEmulation() {
+              std::scoped_lock lock(m_mutex);
+              // Eden A840 v2.4: undo the automatic profile once the guest is fully torn down.
+              SCOPE_EXIT {
+                  EdenAutoTune::OnShutdown();
+              };
+          """,
+          "Native: restore settings after shutdown")
+
+          edit("src/android/app/src/main/jni/native.cpp",
+          """                                                                       jstring file_redirect_dir) {
+              // Log active Freedreno environment variables
+          """,
+          """                                                                       jstring file_redirect_dir) {
+              // Eden A840 v2.4: driver flags for the automatic optimisation (read once per process).
+              EdenAutoTune::PrepareDriverEnv();
+
+              // Log active Freedreno environment variables
+          """,
+          "Native: driver env before first Vulkan use")
+
+          edit("src/android/app/src/main/jni/native.cpp",
+          """jdoubleArray Java_org_yuzu_yuzu_1emu_NativeLibrary_getPerfStats(JNIEnv* env, jclass clazz) {""",
+          """// Eden A840 v2.4: automatic per-game optimisation.
+          jint Java_org_yuzu_yuzu_1emu_NativeLibrary_autoTunePrepare(JNIEnv* env, jobject obj,
+                                                                     jstring j_program_id,
+                                                                     jlongArray j_crash_times,
+                                                                     jstring j_driver) {
+              std::vector<std::int64_t> crash_times;
+              if (j_crash_times != nullptr) {
+                  const jsize count = env->GetArrayLength(j_crash_times);
+                  crash_times.resize(static_cast<std::size_t>(count));
+                  if (count > 0) {
+                      env->GetLongArrayRegion(j_crash_times, 0, count,
+                                              reinterpret_cast<jlong*>(crash_times.data()));
+                  }
+              }
+              return static_cast<jint>(EdenAutoTune::Prepare(Common::Android::GetJString(env, j_program_id),
+                                                             crash_times,
+                                                             Common::Android::GetJString(env, j_driver)));
+          }
+
+          void Java_org_yuzu_yuzu_1emu_NativeLibrary_autoTuneSuspend(JNIEnv* env, jobject obj) {
+              EdenAutoTune::Suspend();
+          }
+
+          void Java_org_yuzu_yuzu_1emu_NativeLibrary_autoTuneResume(JNIEnv* env, jobject obj) {
+              EdenAutoTune::Resume();
+          }
+
+          jdoubleArray Java_org_yuzu_yuzu_1emu_NativeLibrary_getPerfStats(JNIEnv* env, jclass clazz) {""",
+          "Native: auto-tune JNI entry points")
+
+          edit("src/android/app/src/main/jni/native_config.cpp",
+          """#include "native.h\"""",
+          """#include "eden_auto_tune.h"
+          #include "native.h\"""",
+          "Config: include auto-tune")
+
+          edit("src/android/app/src/main/jni/native_config.cpp",
+          """void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_savePerGameConfig(JNIEnv* env, jobject obj) {
+              per_game_config->AndroidConfig::SaveAllValues();
+          }""",
+          """void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_savePerGameConfig(JNIEnv* env, jobject obj) {
+              // Eden A840 v2.4: never write auto-tuned values into the game's own settings file.
+              const bool tuned = EdenAutoTune::Suspend();
+              per_game_config->AndroidConfig::SaveAllValues();
+              if (tuned) {
+                  EdenAutoTune::Resume();
+              }
+          }""",
+          "Config: keep auto-tune out of per-game files")
+
+          # ---------------------------------------------------------------------------
+          # 3. Kotlin: JNI declarations, helper, setting, UI and strings.
+          # ---------------------------------------------------------------------------
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/NativeLibrary.kt",
+          """    /**
+               * Returns the performance stats for the current game
+               */
+              external fun getPerfStats(): DoubleArray""",
+          """    /**
+               * Eden A840 v2.4: prepares the automatic optimisation for the game about to boot.
+               * Returns -1 when it is off, otherwise level | (event shl 4).
+               */
+              external fun autoTunePrepare(programId: String, crashTimes: LongArray, driverTag: String): Int
+
+              /** Eden A840 v2.4: hands the user's own values back while settings are open. */
+              external fun autoTuneSuspend()
+
+              /** Eden A840 v2.4: re-applies the automatic profile after the settings screen closes. */
+              external fun autoTuneResume()
+
+              /**
+               * Returns the performance stats for the current game
+               */
+              external fun getPerfStats(): DoubleArray""",
+          "Kotlin: JNI declarations")
+          write_new("src/android/app/src/main/java/org/yuzu/yuzu_emu/utils/AutoTuneHelper.kt", r"""// SPDX-License-Identifier: GPL-3.0-or-later
+          // Eden A840 v2.4: helpers for the automatic per-game optimisation.
+
+          package org.yuzu.yuzu_emu.utils
+
+          import android.app.ActivityManager
+          import android.app.ApplicationExitInfo
+          import android.content.Context
+          import android.os.Build
+          import java.io.File
+          import org.yuzu.yuzu_emu.R
+          import org.yuzu.yuzu_emu.features.settings.model.StringSetting
+
+          object AutoTuneHelper {
+              /** Times (System.currentTimeMillis) at which this app recently crashed or stopped responding. */
+              fun recentCrashTimes(context: Context): LongArray {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                      return LongArray(0)
+                  }
+                  return try {
+                      val manager = context.getSystemService(ActivityManager::class.java)
+                          ?: return LongArray(0)
+                      manager.getHistoricalProcessExitReasons(null, 0, 16)
+                          .filter {
+                              it.reason == ApplicationExitInfo.REASON_CRASH ||
+                                  it.reason == ApplicationExitInfo.REASON_CRASH_NATIVE ||
+                                  it.reason == ApplicationExitInfo.REASON_ANR
+                          }
+                          .map { it.timestamp }
+                          .toLongArray()
+                  } catch (e: Exception) {
+                      LongArray(0)
+                  }
+              }
+
+              /** Identifies the GPU driver in use so learned levels reset when it changes. */
+              fun driverTag(): String = try {
+                  val path = StringSetting.DRIVER_PATH.getString()
+                  if (path.isEmpty()) "system" else File(path).name
+              } catch (e: Exception) {
+                  "unknown"
+              }
+
+              fun describe(context: Context, code: Int): String {
+                  val level = code and 0xF
+                  val event = (code shr 4) and 0xF
+                  val levelName = context.getString(
+                      when (level) {
+                          0 -> R.string.auto_tune_level_performance
+                          1 -> R.string.auto_tune_level_balanced
+                          else -> R.string.auto_tune_level_stable
+                      }
+                  )
+                  val text = context.getString(R.string.auto_tune_toast, levelName)
+                  val note = when (event) {
+                      1 -> R.string.auto_tune_event_crash
+                      2 -> R.string.auto_tune_event_probe
+                      3 -> R.string.auto_tune_event_reset
+                      else -> 0
+                  }
+                  return if (note != 0) "$text · ${context.getString(note)}" else text
+              }
+          }
+          """,
+          "Kotlin: AutoTuneHelper")
+
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/BooleanSetting.kt",
+          """    UNLOCK_GUEST_FPS("unlock_guest_fps"),""",
+          """    UNLOCK_GUEST_FPS("unlock_guest_fps"),
+              EDEN_AUTO_TUNE("eden_auto_tune"),""",
+          "UI: setting key")
+
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt",
+          """            put(
+                          SwitchSetting(
+                              BooleanSetting.UNLOCK_GUEST_FPS,
+                              titleId = R.string.unlock_guest_fps,
+                              descriptionId = R.string.unlock_guest_fps_description
+                          )
+                      )""",
+          """            put(
+                          SwitchSetting(
+                              BooleanSetting.UNLOCK_GUEST_FPS,
+                              titleId = R.string.unlock_guest_fps,
+                              descriptionId = R.string.unlock_guest_fps_description
+                          )
+                      )
+                      put(
+                          SwitchSetting(
+                              BooleanSetting.EDEN_AUTO_TUNE,
+                              titleId = R.string.auto_tune,
+                              descriptionId = R.string.auto_tune_description
+                          )
+                      )""",
+          "UI: switch item")
+
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt",
+          """    private fun addGraphicsSettings(sl: ArrayList<SettingsItem>) {
+                  sl.apply {
+                      add(IntSetting.RENDERER_RESOLUTION.key)""",
+          """    private fun addGraphicsSettings(sl: ArrayList<SettingsItem>) {
+                  sl.apply {
+                      add(BooleanSetting.EDEN_AUTO_TUNE.key)
+                      add(IntSetting.RENDERER_RESOLUTION.key)""",
+          "UI: switch at the top of Graphics")
+
+          edit("src/android/app/src/main/res/values/strings.xml",
+          """    <string name="unlock_guest_fps">Unlock game FPS (experimental)</string>""",
+          """    <string name="auto_tune">A840 auto-optimization</string>
+              <string name="auto_tune_description">Chooses the best settings for each game on this Snapdragon: NCE, asynchronous shaders, 4 shader threads, even 120 Hz pacing and max GPU clocks (Turnip A840 v2.3 or newer). If a game crashes, that game moves to safer settings by itself. Anything you set for a specific game is kept.</string>
+              <string name="auto_tune_toast">Auto A840: %1$s</string>
+              <string name="auto_tune_level_performance">Performance</string>
+              <string name="auto_tune_level_balanced">Balanced</string>
+              <string name="auto_tune_level_stable">Stable</string>
+              <string name="auto_tune_event_crash">adjusted after a crash</string>
+              <string name="auto_tune_event_probe">trying the faster mode again</string>
+              <string name="auto_tune_event_reset">reset for a new app or driver</string>
+              <string name="unlock_guest_fps">Unlock game FPS (experimental)</string>""",
+          "UI: strings (en)")
+
+          edit("src/android/app/src/main/res/values-es/strings.xml",
+          """    <string name="unlock_guest_fps">Desbloquear FPS del juego (experimental)</string>""",
+          """    <string name="auto_tune">Optimización automática A840</string>
+              <string name="auto_tune_description">Elige la mejor configuración para cada juego en este Snapdragon: NCE, sombreadores asíncronos, 4 hilos de sombreadores, ritmo uniforme a 120 Hz y GPU al máximo (Turnip A840 v2.3 o más nuevo). Si un juego se cierra, ese juego pasa solo a ajustes más seguros. Respeta lo que configures a mano para un juego concreto.</string>
+              <string name="auto_tune_toast">Auto A840: %1$s</string>
+              <string name="auto_tune_level_performance">Rendimiento</string>
+              <string name="auto_tune_level_balanced">Equilibrado</string>
+              <string name="auto_tune_level_stable">Estable</string>
+              <string name="auto_tune_event_crash">ajustado tras un cierre</string>
+              <string name="auto_tune_event_probe">probando de nuevo el modo rápido</string>
+              <string name="auto_tune_event_reset">reiniciado por nueva app o driver</string>
+              <string name="unlock_guest_fps">Desbloquear FPS del juego (experimental)</string>""",
+          "UI: strings (es)")
+
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/fragments/EmulationFragment.kt",
+          """import org.yuzu.yuzu_emu.utils.CustomSettingsHandler""",
+          """import org.yuzu.yuzu_emu.utils.CustomSettingsHandler
+          import org.yuzu.yuzu_emu.utils.AutoTuneHelper""",
+          "Fragment: import helper")
+
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/fragments/EmulationFragment.kt",
+          """        } catch (e: Exception) {
+                      Log.warning("[EmulationFragment] Failed to load Freedreno config: ${e.message}")
+                  }
+          """,
+          """        } catch (e: Exception) {
+                      Log.warning("[EmulationFragment] Failed to load Freedreno config: ${e.message}")
+                  }
+
+                  // Eden A840 v2.4: automatic per-game optimisation (Settings > Graphics).
+                  try {
+                      val tune = NativeLibrary.autoTunePrepare(
+                          game!!.programIdHex,
+                          AutoTuneHelper.recentCrashTimes(requireContext()),
+                          AutoTuneHelper.driverTag()
+                      )
+                      if (tune >= 0) {
+                          Toast.makeText(
+                              requireContext(),
+                              AutoTuneHelper.describe(requireContext(), tune),
+                              Toast.LENGTH_SHORT
+                          ).show()
+                      }
+                  } catch (e: Throwable) {
+                      Log.warning("[EmulationFragment] Auto-tune failed: ${e.message}")
+                  }
+          """,
+          "Fragment: prepare auto-tune before boot")
+
+          # ---------------------------------------------------------------------------
+          # 4. Latency: unbuffered input + exact 120 Hz pacing when auto-tune is on.
+          #    Android batches joystick and touch motion events to the next display
+          #    frame; unbuffered dispatch delivers them as soon as they arrive.
+          # ---------------------------------------------------------------------------
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt",
+          """        // Eden A840 v2.3: keep the game window at the panel's highest refresh rate.
+                  runCatching {
+                      display?.supportedModes?.maxByOrNull { it.refreshRate }?.let { mode ->
+                          val params = window.attributes
+                          params.preferredDisplayModeId = mode.modeId
+                          window.attributes = params
+                      }
+                  }
+          """,
+          """        // Eden A840 v2.4: panel mode for the game window. With the A840 auto-optimisation on,
+                  // prefer an exact multiple of 60 Hz (120 Hz) so 30/60 fps games get even frame pacing;
+                  // otherwise keep the v2.3 behaviour (highest refresh rate).
+                  runCatching {
+                      val modes = display?.supportedModes ?: emptyArray<android.view.Display.Mode>()
+                      val current = display?.mode
+                      val sameSize = modes.filter {
+                          current == null || (it.physicalWidth == current.physicalWidth &&
+                              it.physicalHeight == current.physicalHeight)
+                      }.ifEmpty { modes.toList() }
+                      val evenPacing = sameSize.filter {
+                          val ratio = it.refreshRate / 60f
+                          it.refreshRate >= 59f && kotlin.math.abs(ratio - ratio.roundToInt()) < 0.02f
+                      }.maxByOrNull { it.refreshRate }
+                      val fastest = sameSize.maxByOrNull { it.refreshRate }
+                      val autoTune = BooleanSetting.EDEN_AUTO_TUNE.getBoolean(true)
+                      (if (autoTune) evenPacing ?: fastest else fastest)?.let { mode ->
+                          val params = window.attributes
+                          params.preferredDisplayModeId = mode.modeId
+                          window.attributes = params
+                      }
+                  }
+                  window.decorView.post { requestLowLatencyInput() }
+          """,
+          "Display/input: 120 Hz pacing and low-latency input")
+
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/activities/EmulationActivity.kt",
+          """    override fun onResume() {
+                  super.onResume()
+                  nfcReader.startScanning()""",
+          """    override fun onWindowFocusChanged(hasFocus: Boolean) {
+                  super.onWindowFocusChanged(hasFocus)
+                  if (hasFocus) {
+                      requestLowLatencyInput()
+                  }
+              }
+
+              // Eden A840 v2.4: deliver controller and touch input as soon as it arrives instead of
+              // batching it to the next display frame (up to one frame less input latency).
+              private fun requestLowLatencyInput() {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                      return
+                  }
+                  runCatching {
+                      window.decorView.requestUnbufferedDispatch(
+                          InputDevice.SOURCE_CLASS_JOYSTICK or InputDevice.SOURCE_CLASS_POINTER
+                      )
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  nfcReader.startScanning()""",
+          "Input: unbuffered dispatch for controllers and touch")
+
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsActivity.kt",
+          """    override fun onCreate(savedInstanceState: Bundle?) {
+                  ThemeHelper.setTheme(this)
+
+                  super.onCreate(savedInstanceState)
+          """,
+          """    override fun onCreate(savedInstanceState: Bundle?) {
+                  ThemeHelper.setTheme(this)
+
+                  super.onCreate(savedInstanceState)
+                  // Eden A840 v2.4: edit the user's own values, not the automatic profile.
+                  NativeLibrary.autoTuneSuspend()
+          """,
+          "Settings screen: suspend auto-tune")
+
+          edit("src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsActivity.kt",
+          """            } else if (NativeConfig.isPerGameConfigLoaded()) {
+                          NativeLibrary.logSettings()
+                          NativeConfig.savePerGameConfig()
+                          NativeConfig.unloadPerGameConfig()
+                      }
+          """,
+          """            } else if (NativeConfig.isPerGameConfigLoaded()) {
+                          NativeLibrary.logSettings()
+                          NativeConfig.savePerGameConfig()
+                          NativeConfig.unloadPerGameConfig()
+                      }
+                      NativeLibrary.autoTuneResume()
+          """,
+          "Settings screen: resume auto-tune")
+
+          print("Eden A840 v2.4: all patches applied")
+          EDEN_PY24_EOF
+
       - name: Compilar APK (tarda 1-2 horas)
         working-directory: src/android
         run: |
@@ -796,7 +1660,7 @@ jobs:
       - name: Guardar APK
         uses: actions/upload-artifact@v4
         with:
-          name: Eden-A840-v2.3-apk
+          name: Eden-A840-v2.4-apk
           path: src/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
 
@@ -805,11 +1669,11 @@ jobs:
           set -e
           APK=$(find src/android/app/build/outputs/apk -name '*.apk' | head -1)
           rm -rf /tmp/builds && mkdir -p /tmp/builds
-          cp "$APK" /tmp/builds/Eden-A840-v2.3.apk
+          cp "$APK" /tmp/builds/Eden-A840-v2.4.apk
           cd /tmp/builds
-          sha256sum Eden-A840-v2.3.apk > Eden-A840-v2.3.apk.sha256
-          cat Eden-A840-v2.3.apk.sha256
+          sha256sum Eden-A840-v2.4.apk > Eden-A840-v2.4.apk.sha256
+          cat Eden-A840-v2.4.apk.sha256
           git init -q -b builds
           git add .
-          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -q -m "Eden A840 v2.3 APK (${GITHUB_SHA::7})"
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -q -m "Eden A840 v2.4 APK (${GITHUB_SHA::7})"
           git push -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" builds
